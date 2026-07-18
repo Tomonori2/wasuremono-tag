@@ -326,9 +326,28 @@ async function updateWakeLock() {
   }
 }
 chkAwake.addEventListener("change", updateWakeLock);
-// 一度画面が消えて戻ってきた時に、つけっぱなし設定を復活させる
+
+// ===== アプリが裏に回った・戻ってきた時の処理 =====
+// Androidは電池節約のため、裏に回ったアプリのBluetooth通信を止めてしまうことがある。
+// なので「裏に回った時に一度だけ知らせる」「戻ってきたら自動でつなぎ直す」で埋め合わせる。
+let hiddenNoticeShown = false;
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && chkAwake.checked && !wakeLock) updateWakeLock();
+  if (document.visibilityState === "visible") {
+    hiddenNoticeShown = false;
+    // 一度画面が消えて戻ってきた時に、つけっぱなし設定を復活させる
+    if (chkAwake.checked && !wakeLock) updateWakeLock();
+    // 裏に回っている間に切れていたら、戻ってきた瞬間につなぎ直しを試す
+    if (device && !device.gatt.connected && !reconnectTimer) {
+      log("📱 アプリに戻りました。つなぎ直しを試みます…");
+      tryReconnect(1);
+    }
+  } else {
+    // 裏に回った瞬間。見守り中なら一度だけ知らせておく（切れて初めて気づくのを防ぐ）
+    if (device && device.gatt && device.gatt.connected && !hiddenNoticeShown) {
+      hiddenNoticeShown = true;
+      log("📱 アプリが裏に回りました。この間は見守りが途切れることがあります（Androidの節電機能のため）");
+    }
+  }
 });
 
 // ===== タグとの接続 =====
