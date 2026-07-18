@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>忘れ物防止タグ</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#4a90d9">
+<link rel="icon" href="icon-192.png">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+    background: #f0f4f8;
+    color: #333;
+    padding: 16px;
+    max-width: 480px;
+    margin: 0 auto;
+    -webkit-tap-highlight-color: transparent;
+  }
+  h1 { font-size: 20px; text-align: center; margin: 8px 0 16px; }
+
+  /* 大きな状態表示（まる） */
+  .big-status {
+    width: 180px;
+    height: 180px;
+    border-radius: 50%;
+    margin: 0 auto 8px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    font-weight: bold;
+    background: #ddd;
+    color: #666;
+    transition: background 0.3s;
+  }
+  .big-status .icon { font-size: 48px; margin-bottom: 4px; }
+  .big-status.watching { background: #d4edda; color: #155724; box-shadow: 0 0 0 8px #d4edda55; }
+  .big-status.lost { background: #f8d7da; color: #721c24; box-shadow: 0 0 0 8px #f8d7da88; animation: blink 0.8s infinite; }
+  @keyframes blink { 50% { opacity: 0.6; } }
+
+  .battery { text-align: center; font-size: 14px; color: #666; margin-bottom: 12px; min-height: 20px; }
+
+  .card {
+    background: #fff;
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 12px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+  }
+  button {
+    width: 100%;
+    padding: 16px;
+    font-size: 17px;
+    border: none;
+    border-radius: 10px;
+    background: #4a90d9;
+    color: #fff;
+    margin-top: 8px;
+    cursor: pointer;
+  }
+  button:first-child { margin-top: 0; }
+  button:disabled { background: #bbb; }
+  button.green { background: #5cb85c; }
+  button.gray { background: #999; }
+  label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 15px;
+    padding: 8px 0;
+  }
+  input[type="checkbox"] { width: 20px; height: 20px; }
+  details { margin-top: 8px; }
+  summary { font-size: 14px; color: #666; cursor: pointer; }
+  #log {
+    font-size: 11px;
+    font-family: monospace;
+    background: #222;
+    color: #9f9;
+    border-radius: 8px;
+    padding: 8px;
+    height: 140px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin-top: 8px;
+  }
+  .footer { text-align: center; margin: 16px 0; }
+  .footer a { color: #4a90d9; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>🔑 忘れ物防止タグ</h1>
+
+<div id="bigStatus" class="big-status">
+  <div class="icon">💤</div>
+  <div id="statusText">未接続</div>
+</div>
+<div id="battery" class="battery"></div>
+
+<div class="card">
+  <button id="btnConnect">📶 タグとつなぐ</button>
+  <button id="btnBeep" class="green" disabled>🔔 タグを鳴らして探す</button>
+  <button id="btnStop" class="gray" disabled>🔕 音を止める</button>
+</div>
+
+<div class="card">
+  <label><input type="checkbox" id="chkReconnect" checked> 切れたら自動でつなぎ直す</label>
+  <label><input type="checkbox" id="chkAwake"> 画面をつけたままにする（見守り用）</label>
+  <button id="btnDisconnect" class="gray" disabled>切断する</button>
+</div>
+
+<div class="card">
+  <details>
+    <summary>📋 くわしい記録（ログ）</summary>
+    <div id="log"></div>
+  </details>
+</div>
+
+<div class="footer"><a href="shindan.html">🔧 診断ページを開く</a></div>
+
+<script>
+// ============================================================
+// 忘れ物防止タグ 本番アプリ
+// このタグの癖（診断で判明）: 鳴らす合図は「1」（標準の「2」は無視される）
+// ============================================================
+
+// ===== 画面の部品 =====
+const bigStatus  = document.getElementById("bigStatus");
+const statusText = document.getElementById("statusText");
+const statusIcon = bigStatus.querySelector(".icon");
+const batteryEl  = document.getElementById("battery");
+const logEl      = document.getElementById("log");
+const btnConnect    = document.getElementById("btnConnect");
+const btnBeep       = document.getElementById("btnBeep");
+const btnStop       = document.getElementById("btnStop");
+const btnDisconnect = document.getElementById("btnDisconnect");
+const chkReconnect  = document.getElementById("chkReconnect");
+const chkAwake      = document.getElementById("chkAwake");
+
+// ===== 覚えておく変数 =====
+let device = null;              // タグ本体
+let alertChar = null;           // 鳴らす合図の書き込み先
+let intentionalDisconnect = false;
+let reconnectTimer = null;      // 自動再接続の予約
+let wakeLock = null;            // 画面つけっぱなし機能
+let audioCtx = null;            // スマホで音を出す装置
+let alarmPlaying = false;       // 警告音を鳴らしている最中か
+
+function log(msg) {
+  const time = new Date().toLocaleTimeString("ja-JP");
+  logEl.textContent += `[${time}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(kind) {
+  bigStatus.className = "big-status";
+  if (kind === "watching") {
+    bigStatus.classList.add("watching");
+    statusIcon.textContent = "🛡️";
+    statusText.textContent = "見守り中";
+  } else if (kind === "lost") {
+    bigStatus.classList.add("lost");
+    statusIcon.textContent = "⚠️";
+    statusText.textContent = "タグが離れた！";
+  } else if (kind === "connecting") {
+    statusIcon.textContent = "📡";
+    statusText.textContent = "接続中…";
+  } else {
+    statusIcon.textContent = "💤";
+    statusText.textContent = "未接続";
+  }
+}
+
+// ===== スマホ側の音 =====
+// ボタンを押した時に音の装置を準備しておく（スマホは操作なしに音を出せない決まりのため）
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") audioCtx.resume();
+}
+
+// beepOnce: 1回ピッと鳴らす部品
+function beepOnce(freq, durationMs, volume) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.frequency.value = freq;
+  gain.gain.value = volume;
+  osc.start();
+  osc.stop(audioCtx.currentTime + durationMs / 1000);
+}
+
+// 警告音（置き忘れ・呼び出し）: 止めるまで or 指定回数鳴り続ける
+function playAlarm(kind) {
+  ensureAudio();
+  alarmPlaying = true;
+  const freq = (kind === "lost") ? 880 : 660;   // 置き忘れ=高い音、呼び出し=少し低い音
+  const maxCount = (kind === "lost") ? 30 : 8;  // 置き忘れは長め(約15秒)
+  let count = 0;
+  const loop = () => {
+    if (!alarmPlaying || count >= maxCount) { alarmPlaying = false; return; }
+    beepOnce(freq, 250, 0.4);
+    if (navigator.vibrate) navigator.vibrate(300);
+    count++;
+    setTimeout(loop, 500);
+  };
+  loop();
+}
+
+function stopAlarm() { alarmPlaying = false; }
+
+// ===== 画面つけっぱなし（Wake Lock） =====
+async function updateWakeLock() {
+  try {
+    if (chkAwake.checked && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+      log("💡 画面をつけたままにします");
+    } else if (!chkAwake.checked && wakeLock) {
+      await wakeLock.release();
+      wakeLock = null;
+      log("💡 画面つけっぱなしを解除しました");
+    }
+  } catch (e) {
+    log("💡 画面つけっぱなし機能が使えませんでした: " + e.message);
+    chkAwake.checked = false;
+  }
+}
+chkAwake.addEventListener("change", updateWakeLock);
+// 一度画面が消えて戻ってきた時に、つけっぱなし設定を復活させる
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && chkAwake.checked && !wakeLock) updateWakeLock();
+});
+
+// ===== タグとの接続 =====
+btnConnect.addEventListener("click", async () => {
+  ensureAudio(); // ここで音の準備もしておく
+  if (!navigator.bluetooth) {
+    alert("このブラウザはBluetoothに対応していません。\nAndroidのChromeか、PCのEdge/Chromeで開いてください。\n（ホーム画面アイコンやhttps経由で開く必要があります）");
+    return;
+  }
+  try {
+    if (!device) {
+      log("タグを探しています…");
+      device = await navigator.bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: ["immediate_alert", "link_loss", "battery_service", 0xFFE0]
+      });
+      device.addEventListener("gattserverdisconnected", onDisconnected);
+      log(`発見: ${device.name || "(名前なし)"}`);
+    }
+    await connectAndSetup();
+  } catch (e) {
+    if (e.name === "NotFoundError") {
+      log("タグが選ばれませんでした");
+    } else {
+      log("❌ 接続エラー: " + e.message);
+    }
+  }
+});
+
+// 接続して、必要な機能を準備する（初回も再接続も共通）
+async function connectAndSetup() {
+  setStatus("connecting");
+  const server = await device.gatt.connect();
+
+  // 鳴らす機能
+  try {
+    const s = await server.getPrimaryService("immediate_alert");
+    alertChar = await s.getCharacteristic("alert_level");
+  } catch (e) {
+    alertChar = null;
+    log("（鳴らす機能が見つかりませんでした）");
+  }
+
+  // 電池残量
+  try {
+    const s = await server.getPrimaryService("battery_service");
+    const c = await s.getCharacteristic("battery_level");
+    const v = await c.readValue();
+    batteryEl.textContent = `🔋 タグの電池: ${v.getUint8(0)}%`;
+  } catch (e) { /* 電池機能がないタグもある */ }
+
+  // タグのボタン → スマホを鳴らす
+  try {
+    const s = await server.getPrimaryService(0xFFE0);
+    const chars = await s.getCharacteristics();
+    for (const c of chars) {
+      if (c.properties.notify) {
+        await c.startNotifications();
+        c.addEventListener("characteristicvaluechanged", () => {
+          log("🔘 タグのボタンが押されました → スマホを鳴らします");
+          playAlarm("call");
+        });
+      }
+    }
+  } catch (e) { /* ボタン機能がないタグもある */ }
+
+  setStatus("watching");
+  btnConnect.disabled = true;
+  btnBeep.disabled = !alertChar;
+  btnStop.disabled = !alertChar;
+  btnDisconnect.disabled = false;
+  stopAlarm();
+  log("✅ 接続完了。見守りを始めます");
+}
+
+// ===== 接続が切れたとき =====
+function onDisconnected() {
+  alertChar = null;
+  btnBeep.disabled = true;
+  btnStop.disabled = true;
+
+  if (intentionalDisconnect) {
+    intentionalDisconnect = false;
+    setStatus("idle");
+    btnConnect.disabled = false;
+    btnDisconnect.disabled = true;
+    batteryEl.textContent = "";
+    log("切断しました");
+    return;
+  }
+
+  // 勝手に切れた ＝ タグが離れた（置き忘れ？）
+  setStatus("lost");
+  log("⚠️ タグとの接続が切れました！（置き忘れ？）");
+  playAlarm("lost");
+
+  if (chkReconnect.checked) {
+    log("🔄 自動でつなぎ直しを試みます…");
+    tryReconnect(1);
+  } else {
+    btnConnect.disabled = false;
+    btnDisconnect.disabled = true;
+  }
+}
+
+// 自動再接続: 5秒おきに試す（タグが近くに戻れば自動復帰する）
+function tryReconnect(attempt) {
+  if (!device || device.gatt.connected || !chkReconnect.checked) return;
+  reconnectTimer = setTimeout(async () => {
+    try {
+      log(`🔄 つなぎ直し ${attempt}回目…`);
+      await connectAndSetup();
+      log("✅ 復帰しました！");
+      beepOnce(1320, 150, 0.3); // 復帰のお知らせ音（短くピッ）
+    } catch (e) {
+      tryReconnect(attempt + 1);
+    }
+  }, 5000);
+}
+
+// ===== ボタン類 =====
+btnDisconnect.addEventListener("click", () => {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (device && device.gatt.connected) {
+    intentionalDisconnect = true;
+    device.gatt.disconnect();
+  }
+});
+
+// このタグは「1」で鳴る（診断で確認済み）
+async function writeAlert(value) {
+  if (!alertChar) return;
+  try {
+    await alertChar.writeValueWithoutResponse(new Uint8Array([value]));
+  } catch (e) {
+    await alertChar.writeValue(new Uint8Array([value]));
+  }
+}
+
+btnBeep.addEventListener("click", async () => {
+  ensureAudio();
+  try {
+    await writeAlert(1);
+    log("🔔 タグを鳴らしています");
+  } catch (e) {
+    log("❌ 鳴らせませんでした: " + e.message);
+  }
+});
+
+btnStop.addEventListener("click", async () => {
+  stopAlarm();
+  try {
+    await writeAlert(0);
+    log("🔕 音を止めました");
+  } catch (e) { /* 既に止まっている場合など */ }
+});
+
+// ===== PWA（ホーム画面アプリ化）の登録 =====
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
+</script>
+</body>
+</html>

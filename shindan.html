@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>忘れ物タグ 接続テスト</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+    background: #f0f4f8;
+    color: #333;
+    padding: 16px;
+    max-width: 480px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 20px; text-align: center; margin: 8px 0 16px; }
+  .card {
+    background: #fff;
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 12px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+  }
+  .status {
+    text-align: center;
+    font-size: 16px;
+    font-weight: bold;
+    padding: 12px;
+    border-radius: 8px;
+    background: #eee;
+  }
+  .status.connected { background: #d4edda; color: #155724; }
+  .status.disconnected { background: #f8d7da; color: #721c24; }
+  button {
+    width: 100%;
+    padding: 14px;
+    font-size: 16px;
+    border: none;
+    border-radius: 8px;
+    background: #4a90d9;
+    color: #fff;
+    margin-top: 8px;
+    cursor: pointer;
+  }
+  button:disabled { background: #bbb; }
+  button.danger { background: #d9534f; }
+  button.green { background: #5cb85c; }
+  #log {
+    font-size: 12px;
+    font-family: monospace;
+    background: #222;
+    color: #9f9;
+    border-radius: 8px;
+    padding: 10px;
+    height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .battery { text-align: center; font-size: 14px; margin-top: 8px; color: #666; }
+</style>
+</head>
+<body>
+
+<h1>🔑 忘れ物タグ 接続テスト</h1>
+
+<div class="card">
+  <div id="status" class="status">未接続</div>
+  <div id="battery" class="battery"></div>
+  <button id="btnConnect">📶 タグに接続する</button>
+  <button id="btnDisconnect" disabled>切断する</button>
+</div>
+
+<div class="card">
+  <button id="btnBeep" class="green" disabled>🔔 タグの音を鳴らす</button>
+  <button id="btnStop" disabled>🔕 音を止める</button>
+  <button id="btnTestAll" disabled>🔍 鳴らし方を全部試す（3秒おきに順番に送信）</button>
+</div>
+
+<div class="card">
+  <div style="font-size:14px; color:#666; margin-bottom:4px;">📋 ログ（動作の記録）</div>
+  <div id="log"></div>
+</div>
+
+<script>
+// ===== 画面の部品 =====
+const statusEl  = document.getElementById("status");
+const batteryEl = document.getElementById("battery");
+const logEl     = document.getElementById("log");
+const btnConnect    = document.getElementById("btnConnect");
+const btnDisconnect = document.getElementById("btnDisconnect");
+const btnBeep = document.getElementById("btnBeep");
+const btnStop = document.getElementById("btnStop");
+const btnTestAll = document.getElementById("btnTestAll");
+
+// ===== 接続情報を覚えておく変数 =====
+let device = null;        // タグ本体
+let alertChar = null;     // 「音を鳴らせ」と命令を書き込む場所
+let writableChars = [];   // 書き込みできる場所の一覧（鳴らし方テスト用）
+let intentionalDisconnect = false; // 自分で切断ボタンを押したかどうか
+
+// ログを画面に出す
+function log(msg) {
+  const time = new Date().toLocaleTimeString("ja-JP");
+  logEl.textContent += `[${time}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// 接続状態の表示を切り替える
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = "status " + (cls || "");
+}
+
+// ===== スマホ側で警告音を鳴らす（置き忘れ警告・呼び出し用） =====
+function playPhoneAlarm() {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  let count = 0;
+  const beep = () => {
+    if (count >= 6) { ctx.close(); return; }
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = 880;
+    gain.gain.value = 0.3;
+    osc.start();
+    osc.stop(ctx.currentTime + 0.2);
+    count++;
+    setTimeout(beep, 350);
+  };
+  beep();
+  if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
+}
+
+// ===== 接続 =====
+btnConnect.addEventListener("click", async () => {
+  if (!navigator.bluetooth) {
+    alert("このブラウザはWeb Bluetoothに対応していません。\nAndroidのChromeで開いてください。\n（file://で開いている場合も使えません）");
+    return;
+  }
+  try {
+    log("タグを探しています…（選択画面が出ます）");
+    device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      // 後で使いたい機能（サービス）を先に申請しておく決まり
+      optionalServices: [
+        "immediate_alert",  // 音を鳴らす機能
+        "link_loss",        // 接続切れ検知の機能
+        "battery_service",  // 電池残量
+        0xFFE0              // 安いタグによくある「ボタン通知」機能
+      ]
+    });
+    log(`発見: ${device.name || "(名前なし)"}`);
+
+    // 接続が切れたときに呼ばれる
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    log("接続中…");
+    const server = await device.gatt.connect();
+    setStatus(`接続中: ${device.name || "タグ"}`, "connected");
+    btnConnect.disabled = true;
+    btnDisconnect.disabled = false;
+    writableChars = [];
+    btnTestAll.disabled = false;
+    log("✅ 接続できました！");
+
+    // --- タグの中にある機能を全部調べてログに出す ---
+    const services = await server.getPrimaryServices();
+    log(`--- タグの機能一覧（${services.length}個） ---`);
+    for (const s of services) {
+      log(`サービス: ${s.uuid}`);
+      try {
+        const chars = await s.getCharacteristics();
+        for (const c of chars) {
+          const props = [];
+          if (c.properties.read) props.push("読取");
+          if (c.properties.write) props.push("書込");
+          if (c.properties.writeWithoutResponse) props.push("書込(応答なし)");
+          if (c.properties.notify) props.push("通知");
+          log(`  └ 項目: ${c.uuid} [${props.join("・")}]`);
+          // 書き込める場所は「鳴らし方テスト」の候補として覚えておく
+          if (c.properties.write || c.properties.writeWithoutResponse) {
+            writableChars.push(c);
+          }
+        }
+      } catch (e) {
+        log("  └ (項目の取得に失敗)");
+      }
+    }
+    log("--- 一覧ここまで ---");
+
+    // --- 音を鳴らす機能を探す ---
+    try {
+      const alertService = await server.getPrimaryService("immediate_alert");
+      alertChar = await alertService.getCharacteristic("alert_level");
+      btnBeep.disabled = false;
+      btnStop.disabled = false;
+      log("🔔 音を鳴らす機能: あり");
+    } catch (e) {
+      log("🔔 音を鳴らす機能: 見つかりませんでした");
+    }
+
+    // --- 電池残量を読む ---
+    try {
+      const battService = await server.getPrimaryService("battery_service");
+      const battChar = await battService.getCharacteristic("battery_level");
+      const value = await battChar.readValue();
+      const percent = value.getUint8(0);
+      batteryEl.textContent = `🔋 電池残量: ${percent}%`;
+      log(`🔋 電池残量: ${percent}%`);
+    } catch (e) {
+      log("🔋 電池残量: 取得できませんでした");
+    }
+
+    // --- タグのボタン押下の通知を受け取る ---
+    try {
+      const btnService = await server.getPrimaryService(0xFFE0);
+      const chars = await btnService.getCharacteristics();
+      for (const c of chars) {
+        if (c.properties.notify) {
+          await c.startNotifications();
+          c.addEventListener("characteristicvaluechanged", () => {
+            log("🔘 タグのボタンが押されました！ スマホ側で音を鳴らします");
+            playPhoneAlarm();
+          });
+          log("🔘 ボタン検知: 準備OK（タグのボタンを押してみてください）");
+        }
+      }
+    } catch (e) {
+      log("🔘 ボタン検知: この機能は見つかりませんでした");
+    }
+
+  } catch (e) {
+    if (e.name === "NotFoundError") {
+      log("キャンセルされました（タグが選ばれませんでした）");
+    } else {
+      log("❌ エラー: " + e.message);
+    }
+  }
+});
+
+// ===== 切断されたとき（置き忘れ警告の心臓部） =====
+function onDisconnected() {
+  btnBeep.disabled = true;
+  btnStop.disabled = true;
+  btnTestAll.disabled = true;
+  btnConnect.disabled = false;
+  btnDisconnect.disabled = true;
+  alertChar = null;
+  writableChars = [];
+
+  if (intentionalDisconnect) {
+    // 自分で切断ボタンを押した場合は警告しない
+    intentionalDisconnect = false;
+    setStatus("未接続");
+    log("切断しました");
+  } else {
+    // 勝手に切れた＝タグが離れた（置き忘れの可能性！）
+    setStatus("⚠️ タグとの接続が切れました！", "disconnected");
+    log("⚠️ 接続が切れました！ タグを置き忘れていませんか？");
+    playPhoneAlarm();
+  }
+}
+
+// ===== 切断ボタン =====
+btnDisconnect.addEventListener("click", () => {
+  if (device && device.gatt.connected) {
+    intentionalDisconnect = true;
+    device.gatt.disconnect();
+  }
+});
+
+// ===== タグの音を鳴らす／止める =====
+// 共通ルールでは「2」=大音量だが、このタグは「1」でしか鳴らない（診断テストで確認済み）
+btnBeep.addEventListener("click", async () => {
+  if (!alertChar) return;
+  try {
+    await alertChar.writeValueWithoutResponse(new Uint8Array([1]));
+    log("🔔 鳴らす命令を送りました");
+  } catch (e) {
+    // 機種によっては「応答あり書込」しか受け付けないので、両方試す
+    try {
+      await alertChar.writeValue(new Uint8Array([1]));
+      log("🔔 鳴らす命令を送りました（応答あり方式）");
+    } catch (e2) {
+      log("❌ 送信失敗: " + e2.message);
+    }
+  }
+});
+
+btnStop.addEventListener("click", async () => {
+  if (!alertChar) return;
+  try {
+    await alertChar.writeValueWithoutResponse(new Uint8Array([0]));
+    log("🔕 停止命令を送りました");
+  } catch (e) {
+    try {
+      await alertChar.writeValue(new Uint8Array([0]));
+      log("🔕 停止命令を送りました（応答あり方式）");
+    } catch (e2) {
+      log("❌ 送信失敗: " + e2.message);
+    }
+  }
+});
+
+// ===== 鳴らし方を全部試す =====
+// タグの「書き込める場所」全部に、順番に合図（2と1）を送ってみる。
+// 鳴った瞬間のテスト番号がわかれば、そのタグの正しい鳴らし方が確定する。
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function writeTo(c, value) {
+  if (c.properties.writeWithoutResponse) {
+    await c.writeValueWithoutResponse(new Uint8Array([value]));
+  } else {
+    await c.writeValue(new Uint8Array([value]));
+  }
+}
+
+btnTestAll.addEventListener("click", async () => {
+  if (writableChars.length === 0) {
+    log("書き込める場所が見つかっていないため、テストできません");
+    return;
+  }
+  btnTestAll.disabled = true;
+  log("═══ 鳴らし方テスト開始 ═══");
+  log("3秒おきに合図を送ります。🔊タグが鳴った瞬間の「テスト番号」をメモしてください！");
+  let n = 0;
+  for (const c of writableChars) {
+    const shortId = c.uuid.slice(4, 8); // 長い英数字の要点部分だけ表示
+    for (const v of [2, 1]) {
+      n++;
+      log(`▶ テスト${n}: 場所[${shortId}] に合図「${v}」を送信…`);
+      try {
+        await writeTo(c, v);
+      } catch (e) {
+        log(`   (この場所には送れませんでした → スキップ)`);
+        continue;
+      }
+      await sleep(3000);
+      // 鳴りっぱなし防止のため停止合図(0)も送っておく
+      try { await writeTo(c, 0); } catch (e) {}
+      await sleep(500);
+    }
+  }
+  log("═══ テスト終了 ═══");
+  log("鳴ったテスト番号を教えてください（どれも鳴らなければ「全部ダメだった」でOKです）");
+  btnTestAll.disabled = false;
+});
+</script>
+</body>
+</html>

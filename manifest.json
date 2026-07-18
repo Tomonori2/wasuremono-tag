@@ -1,0 +1,13 @@
+{
+  "name": "忘れ物防止タグ",
+  "short_name": "忘れ物タグ",
+  "description": "BLEタグで忘れ物防止。タグを鳴らして探す・スマホを探す・置き忘れ警告",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#f0f4f8",
+  "theme_color": "#4a90d9",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
