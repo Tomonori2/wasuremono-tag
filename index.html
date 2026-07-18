@@ -7,6 +7,9 @@
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#4a90d9">
 <link rel="icon" href="icon-192.png">
+<!-- 地図ライブラリ（Leaflet）と地図データ（OpenStreetMap）は無料・APIキー不要 -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -90,6 +93,11 @@
   }
   .footer { text-align: center; margin: 16px 0; }
   .footer a { color: #4a90d9; font-size: 13px; }
+
+  #lastSeenCard { display: none; }
+  #lastSeenMap { width: 100%; height: 180px; border-radius: 8px; margin-top: 8px; }
+  .last-seen-text { font-size: 14px; color: #555; }
+  .last-seen-text .when { font-size: 12px; color: #999; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -112,6 +120,13 @@
   <label><input type="checkbox" id="chkReconnect" checked> 切れたら自動でつなぎ直す</label>
   <label><input type="checkbox" id="chkAwake"> 画面をつけたままにする（見守り用）</label>
   <button id="btnDisconnect" class="gray" disabled>切断する</button>
+</div>
+
+<div class="card" id="lastSeenCard">
+  <div class="last-seen-text">📍 最後にタグの近くにいた場所</div>
+  <div id="lastSeenMap"></div>
+  <div class="last-seen-text"><span id="lastSeenAddress"></span><div class="when" id="lastSeenWhen"></div></div>
+  <button id="btnOpenMap" class="gray">🗺️ 地図アプリで開く</button>
 </div>
 
 <div class="card">
@@ -141,6 +156,10 @@ const btnStop       = document.getElementById("btnStop");
 const btnDisconnect = document.getElementById("btnDisconnect");
 const chkReconnect  = document.getElementById("chkReconnect");
 const chkAwake      = document.getElementById("chkAwake");
+const lastSeenCard    = document.getElementById("lastSeenCard");
+const lastSeenAddress = document.getElementById("lastSeenAddress");
+const lastSeenWhen    = document.getElementById("lastSeenWhen");
+const btnOpenMap      = document.getElementById("btnOpenMap");
 
 // ===== 覚えておく変数 =====
 let device = null;              // タグ本体
@@ -150,6 +169,10 @@ let reconnectTimer = null;      // 自動再接続の予約
 let wakeLock = null;            // 画面つけっぱなし機能
 let audioCtx = null;            // スマホで音を出す装置
 let alarmPlaying = false;       // 警告音を鳴らしている最中か
+let gpsWatchId = null;          // 現在地の追跡ID
+let currentPosition = null;     // 直近のGPS位置（見守り中に更新され続ける）
+let lastSeenMap = null;         // 「最後にいた場所」の地図（Leaflet）
+let lastSeenMarker = null;
 
 function log(msg) {
   const time = new Date().toLocaleTimeString("ja-JP");
@@ -214,6 +237,76 @@ function playAlarm(kind) {
 }
 
 function stopAlarm() { alarmPlaying = false; }
+
+// ===== 現在地の追跡（「最後にいた場所」用） =====
+// タグと見守り中の間だけ、スマホの現在地を裏で追いかけておく。
+// タグが離れた瞬間に、この最新の位置を「最後にいた場所」として記録する。
+function startGpsWatch() {
+  if (!navigator.geolocation || gpsWatchId !== null) return;
+  gpsWatchId = navigator.geolocation.watchPosition(
+    (pos) => { currentPosition = pos.coords; },
+    (err) => { log("📍 現在地が取得できません: " + err.message); },
+    { enableHighAccuracy: true, maximumAge: 10000 }
+  );
+}
+function stopGpsWatch() {
+  if (gpsWatchId !== null) { navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId = null; }
+}
+
+// 座標から住所を逆引き（Nominatim・無料）。失敗しても地図表示は続けられる
+async function reverseName(lat, lng) {
+  try {
+    const data = await fetch("https://nominatim.openstreetmap.org/reverse?format=json&accept-language=ja&zoom=17" +
+      "&lat=" + lat + "&lon=" + lng).then(r => r.json());
+    if (!data || !data.display_name) return null;
+    return data.display_name.split(",").slice(0, 3).map(s => s.trim()).join("　");
+  } catch { return null; }
+}
+
+// 「最後にいた場所」を保存＆表示する
+async function saveLastSeen(coords) {
+  const record = {
+    lat: coords.latitude,
+    lng: coords.longitude,
+    time: Date.now()
+  };
+  localStorage.setItem("wasuremono_last_seen", JSON.stringify(record));
+  await showLastSeen(record);
+}
+
+async function showLastSeen(record) {
+  lastSeenCard.style.display = "block";
+  const whenText = new Date(record.time).toLocaleString("ja-JP");
+  lastSeenWhen.textContent = whenText + " 時点";
+  lastSeenAddress.textContent = "住所を調べています…";
+
+  if (!lastSeenMap) {
+    lastSeenMap = L.map("lastSeenMap");
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(lastSeenMap);
+  }
+  lastSeenMap.setView([record.lat, record.lng], 17);
+  setTimeout(() => lastSeenMap.invalidateSize(), 100); // 隠れていた地図のサイズ計算をやり直す
+  if (lastSeenMarker) lastSeenMap.removeLayer(lastSeenMarker);
+  lastSeenMarker = L.marker([record.lat, record.lng]).addTo(lastSeenMap);
+
+  const address = await reverseName(record.lat, record.lng);
+  lastSeenAddress.textContent = address || "（住所は取得できませんでした）";
+
+  btnOpenMap.onclick = () => {
+    window.open(`https://www.openstreetmap.org/?mlat=${record.lat}&mlon=${record.lng}#map=18/${record.lat}/${record.lng}`, "_blank");
+  };
+}
+
+// アプリを開いた時、前回の「最後にいた場所」があれば表示しておく
+(function loadSavedLastSeen() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("wasuremono_last_seen"));
+    if (saved) showLastSeen(saved);
+  } catch (e) { /* 保存データがない・壊れている場合は無視 */ }
+})();
 
 // ===== 画面つけっぱなし（Wake Lock） =====
 async function updateWakeLock() {
@@ -308,6 +401,7 @@ async function connectAndSetup() {
   btnStop.disabled = !alertChar;
   btnDisconnect.disabled = false;
   stopAlarm();
+  startGpsWatch();
   log("✅ 接続完了。見守りを始めます");
 }
 
@@ -323,6 +417,7 @@ function onDisconnected() {
     btnConnect.disabled = false;
     btnDisconnect.disabled = true;
     batteryEl.textContent = "";
+    stopGpsWatch();
     log("切断しました");
     return;
   }
@@ -331,6 +426,12 @@ function onDisconnected() {
   setStatus("lost");
   log("⚠️ タグとの接続が切れました！（置き忘れ？）");
   playAlarm("lost");
+  if (currentPosition) {
+    saveLastSeen(currentPosition);
+    log("📍 最後にいた場所を記録しました");
+  } else {
+    log("📍 現在地が取れていなかったため、場所は記録できませんでした");
+  }
 
   if (chkReconnect.checked) {
     log("🔄 自動でつなぎ直しを試みます…");
@@ -338,6 +439,7 @@ function onDisconnected() {
   } else {
     btnConnect.disabled = false;
     btnDisconnect.disabled = true;
+    stopGpsWatch();
   }
 }
 
